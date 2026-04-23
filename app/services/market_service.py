@@ -4,19 +4,14 @@ import ccxt.async_support as ccxt_async
 
 from app.core.config import get_settings
 from app.core.redis_client import get_redis
-from app.exchanges.utils import to_ccxt_binance_futures
+from app.exchanges.utils import ccxt_binance_usdm_demo_api_urls, to_ccxt_binance_futures
 
 
 async def load_markets_unified() -> tuple[ccxt_async.binance, dict]:
     s = get_settings()
     opts: dict = {"options": {"defaultType": "future"}, "enableRateLimit": True}
     if s.binance_testnet:
-        opts["urls"] = {
-            "api": {
-                "public": "https://testnet.binancefuture.com/fapi/v1",
-                "private": "https://testnet.binancefuture.com/fapi/v1",
-            }
-        }
+        opts["urls"] = {"api": ccxt_binance_usdm_demo_api_urls()}
     ex = ccxt_async.binance(opts)
     await ex.load_markets()
     return ex, ex.markets

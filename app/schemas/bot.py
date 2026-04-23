@@ -49,6 +49,7 @@ class BotOut(BaseModel):
     config_version: int
     created_at: object
     updated_at: object | None
+    deleted_at: object | None = None
 
     model_config = {"from_attributes": True}
 
@@ -61,3 +62,23 @@ class BotEventOut(BaseModel):
     created_at: object
 
     model_config = {"from_attributes": True}
+
+
+class BotStopAllFailure(BaseModel):
+    bot_id: int
+    detail: str
+
+
+class BotsStopAllResponse(BaseModel):
+    stopped: list[BotOut]
+    failed: list[BotStopAllFailure]
+
+
+class BotsCloseAllResponse(BaseModel):
+    closed: list[BotOut]
+    failed: list[BotStopAllFailure]
+
+
+class BotsRemoveAllResponse(BaseModel):
+    removed: list[BotOut]
+    failed: list[BotStopAllFailure]

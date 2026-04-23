@@ -3,20 +3,31 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.core.config import get_settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def _sha256_hex_for_bcrypt(password: str) -> str:
+    """Bcrypt only accepts <=72 bytes; SHA-256 hex fits and removes length limits."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    secret = _sha256_hex_for_bcrypt(password).encode("utf-8")
+    return bcrypt.hashpw(secret, bcrypt.gensalt()).decode("ascii")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    h = hashed.encode("ascii")
+    for candidate in (_sha256_hex_for_bcrypt(plain).encode("utf-8"), plain.encode("utf-8")):
+        try:
+            if bcrypt.checkpw(candidate, h):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> str:

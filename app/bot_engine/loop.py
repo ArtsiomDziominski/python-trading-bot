@@ -202,6 +202,20 @@ async def _maybe_restart(s: AsyncSession, bot: Bot, adapter) -> None:
     s.add(BotEvent(bot_id=bot.id, event_type="grid_recreated", payload={"config_version": bot.config_version}))
 
 
+async def exchange_bootstrap_for_bot(s: AsyncSession, bot: Bot, *, user_id: int) -> None:
+    """One exchange pass: sync → optional grid restart → place grid. Caller commits. Sets RUNNING from INIT, clears engine_error on success."""
+    adapter = await build_binance_adapter(s, user_id=user_id, api_key_id=bot.api_key_id)
+    try:
+        if bot.engine_state == EngineState.INIT:
+            bot.engine_state = EngineState.RUNNING
+        await _sync_orders_and_position(s, bot, adapter)
+        await _maybe_restart(s, bot, adapter)
+        await _ensure_grid_once(s, bot, adapter)
+        bot.engine_error = None
+    finally:
+        await adapter.close()
+
+
 async def run_bot(bot_id: int) -> None:
     backoff = 1.0
     while True:
@@ -215,17 +229,8 @@ async def run_bot(bot_id: int) -> None:
                 user = await s.get(User, bot.user_id)
                 if user is None:
                     return
-                adapter = await build_binance_adapter(s, user_id=user.id, api_key_id=bot.api_key_id)
-                try:
-                    if bot.engine_state == EngineState.INIT:
-                        bot.engine_state = EngineState.RUNNING
-                    await _sync_orders_and_position(s, bot, adapter)
-                    await _maybe_restart(s, bot, adapter)
-                    await _ensure_grid_once(s, bot, adapter)
-                    bot.engine_error = None
-                    await s.commit()
-                finally:
-                    await adapter.close()
+                await exchange_bootstrap_for_bot(s, bot, user_id=user.id)
+                await s.commit()
                 backoff = 1.0
         except Exception as e:
             log.exception("bot %s: %s", bot_id, e)

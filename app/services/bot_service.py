@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from ccxt.base.errors import AuthenticationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,7 +18,16 @@ from app.schemas.bot import BotCreate, GridFuturesConfig
 from app.services import audit_service, events_bus
 from app.services.exchange_factory import build_binance_adapter
 from app.services.notification_service import notify_telegram_if_enabled
+from app.bot_engine.loop import exchange_bootstrap_for_bot
 from app.strategies.grid import close_position_order_id
+
+log = logging.getLogger(__name__)
+
+_BINANCE_AUTH_HINT = (
+    "Binance rejected the API key (e.g. -2008 Invalid Api-Key ID). "
+    "Use a valid USDT-M Futures key and set BINANCE_TESTNET to match the key "
+    "(false for binance.com, true for testnet keys only)."
+)
 
 
 async def count_active_bots(db: AsyncSession, user_id: int) -> int:
@@ -29,16 +40,17 @@ async def count_active_bots(db: AsyncSession, user_id: int) -> int:
 
 
 async def create_bot(db: AsyncSession, user: User, body: BotCreate) -> Bot:
+    user_id = user.id
     if body.bot_type != BotType.GRID_FUTURES:
         raise ValueError("Unsupported bot type")
     limit = max_active_bots_for_role(user.role)
-    if await count_active_bots(db, user.id) >= limit:
+    if await count_active_bots(db, user_id) >= limit:
         raise ValueError("Active bot limit reached")
     cfg: GridFuturesConfig = body.config
     result = await db.execute(
         select(ApiKey).where(
             ApiKey.id == body.api_key_id,
-            ApiKey.user_id == user.id,
+            ApiKey.user_id == user_id,
             ApiKey.deleted_at.is_(None),
         )
     )
@@ -46,7 +58,7 @@ async def create_bot(db: AsyncSession, user: User, body: BotCreate) -> Bot:
     if ak is None:
         raise ValueError("API key not found")
     bot = Bot(
-        user_id=user.id,
+        user_id=user_id,
         api_key_id=ak.id,
         bot_type=body.bot_type,
         symbol=cfg.symbol.upper(),
@@ -66,8 +78,28 @@ async def create_bot(db: AsyncSession, user: User, body: BotCreate) -> Bot:
     )
     db.add(snap)
     db.add(BotEvent(bot_id=bot.id, event_type="created", payload={"config_version": bot.config_version}))
-    await events_bus.publish_user(user.id, "bots", {"event": "bot_created", "bot_id": bot.id})
-    notify_telegram_if_enabled(user, f"Бот #{bot.id} создан ({bot.symbol}, GRID_FUTURES).")
+    try:
+        await exchange_bootstrap_for_bot(db, bot, user_id=user_id)
+    except Exception as e:
+        bot.engine_state = EngineState.ERROR
+        bot.engine_error = str(e)[:2000]
+        db.add(BotEvent(bot_id=bot.id, event_type="error", payload={"message": str(e)}))
+    await db.refresh(bot)
+    await events_bus.publish_user(
+        user_id,
+        "bots",
+        {
+            "event": "bot_created",
+            "bot_id": bot.id,
+            "exchange_ok": bot.engine_state != EngineState.ERROR,
+        },
+    )
+    u = await db.get(User, user_id)
+    if u is not None:
+        msg = f"Бот #{bot.id} создан ({bot.symbol}, GRID_FUTURES)."
+        if bot.engine_state == EngineState.ERROR:
+            msg += " Ошибка выставления на бирже — см. engine_error в API."
+        notify_telegram_if_enabled(u, msg)
     return bot
 
 
@@ -101,48 +133,80 @@ async def bot_history(db: AsyncSession, user_id: int, bot_id: int | None = None)
     return list(result.scalars().all())
 
 
-async def stop_bot(db: AsyncSession, user: User, bot_id: int) -> Bot:
-    bot = await get_bot(db, user.id, bot_id)
+async def stop_bot(db: AsyncSession, user_id: int, bot_id: int) -> Bot:
+    bot = await get_bot(db, user_id, bot_id)
     if bot is None:
         raise ValueError("Bot not found")
     if bot.lifecycle_status != BotLifecycleStatus.ACTIVE:
         raise ValueError("Bot is not active")
-    adapter = await build_binance_adapter(db, user_id=user.id, api_key_id=bot.api_key_id)
+    adapter = await build_binance_adapter(db, user_id=user_id, api_key_id=bot.api_key_id)
     try:
-        await adapter.cancel_all_orders(bot.symbol)
+        try:
+            await adapter.cancel_all_orders(bot.symbol)
+        except AuthenticationError as e:
+            raise ValueError(_BINANCE_AUTH_HINT) from e
     finally:
         await adapter.close()
     bot.lifecycle_status = BotLifecycleStatus.STOPPED
     bot.engine_state = EngineState.STOPPED
     db.add(BotEvent(bot_id=bot.id, event_type="stopped", payload={}))
-    await events_bus.publish_user(user.id, "bots", {"event": "bot_stopped", "bot_id": bot.id})
-    notify_telegram_if_enabled(user, f"Бот #{bot.id} остановлен ({bot.symbol}).")
+    await events_bus.publish_user(user_id, "bots", {"event": "bot_stopped", "bot_id": bot.id})
+    u = await db.get(User, user_id)
+    if u is not None:
+        notify_telegram_if_enabled(u, f"Бот #{bot.id} остановлен ({bot.symbol}).")
     return bot
 
 
-async def close_bot(db: AsyncSession, user: User, bot_id: int) -> Bot:
-    bot = await get_bot(db, user.id, bot_id)
+async def stop_all_active_bots(db: AsyncSession, user_id: int) -> tuple[list[Bot], list[tuple[int, str]]]:
+    """Stop every ACTIVE bot for the user; commits after each success so partial progress survives later failures."""
+    res = await db.execute(
+        select(Bot.id)
+        .where(
+            Bot.user_id == user_id,
+            Bot.deleted_at.is_(None),
+            Bot.lifecycle_status == BotLifecycleStatus.ACTIVE,
+        )
+        .order_by(Bot.id.asc())
+    )
+    bot_ids: list[int] = list(res.scalars().all())
+    stopped: list[Bot] = []
+    failed: list[tuple[int, str]] = []
+    for bot_id in bot_ids:
+        try:
+            stopped.append(await stop_bot(db, user_id, bot_id))
+            await db.commit()
+        except ValueError as e:
+            await db.rollback()
+            failed.append((bot_id, str(e)))
+    return stopped, failed
+
+
+async def close_bot(db: AsyncSession, user_id: int, bot_id: int) -> Bot:
+    bot = await get_bot(db, user_id, bot_id)
     if bot is None:
         raise ValueError("Bot not found")
     if bot.lifecycle_status == BotLifecycleStatus.CLOSED:
         raise ValueError("Already closed")
-    adapter = await build_binance_adapter(db, user_id=user.id, api_key_id=bot.api_key_id)
+    adapter = await build_binance_adapter(db, user_id=user_id, api_key_id=bot.api_key_id)
     try:
-        await adapter.cancel_all_orders(bot.symbol)
-        positions = await adapter.get_positions(bot.symbol)
-        for p in positions:
-            if p.size == 0:
-                continue
-            side = OrderSide.SELL if p.side == ExPositionSide.LONG else OrderSide.BUY
-            cid = close_position_order_id(bot.id, bot.config_version)
-            await adapter.place_order(
-                bot.symbol,
-                side,
-                OrderType.MARKET,
-                p.size,
-                reduce_only=True,
-                client_order_id=cid,
-            )
+        try:
+            await adapter.cancel_all_orders(bot.symbol)
+            positions = await adapter.get_positions(bot.symbol)
+            for p in positions:
+                if p.size == 0:
+                    continue
+                side = OrderSide.SELL if p.side == ExPositionSide.LONG else OrderSide.BUY
+                cid = close_position_order_id(bot.id, bot.config_version)
+                await adapter.place_order(
+                    bot.symbol,
+                    side,
+                    OrderType.MARKET,
+                    p.size,
+                    reduce_only=True,
+                    client_order_id=cid,
+                )
+        except AuthenticationError as e:
+            raise ValueError(_BINANCE_AUTH_HINT) from e
     finally:
         await adapter.close()
     bot.lifecycle_status = BotLifecycleStatus.CLOSED
@@ -154,9 +218,86 @@ async def close_bot(db: AsyncSession, user: User, bot_id: int) -> Bot:
             payload={"lifecycle": BotLifecycleStatus.CLOSED.value},
         )
     )
-    await events_bus.publish_user(user.id, "bots", {"event": "bot_closed", "bot_id": bot.id})
-    notify_telegram_if_enabled(user, f"Бот #{bot.id} закрыт ({bot.symbol}).")
+    await events_bus.publish_user(user_id, "bots", {"event": "bot_closed", "bot_id": bot.id})
+    u = await db.get(User, user_id)
+    if u is not None:
+        notify_telegram_if_enabled(u, f"Бот #{bot.id} закрыт ({bot.symbol}).")
     return bot
+
+
+async def close_all_non_closed_bots(db: AsyncSession, user_id: int) -> tuple[list[Bot], list[tuple[int, str]]]:
+    """Close every bot that is not CLOSED (active or stopped); commits after each success."""
+    res = await db.execute(
+        select(Bot.id)
+        .where(
+            Bot.user_id == user_id,
+            Bot.deleted_at.is_(None),
+            Bot.lifecycle_status != BotLifecycleStatus.CLOSED,
+        )
+        .order_by(Bot.id.asc())
+    )
+    bot_ids: list[int] = list(res.scalars().all())
+    closed: list[Bot] = []
+    failed: list[tuple[int, str]] = []
+    for bot_id in bot_ids:
+        try:
+            closed.append(await close_bot(db, user_id, bot_id))
+            await db.commit()
+        except ValueError as e:
+            await db.rollback()
+            failed.append((bot_id, str(e)))
+    return closed, failed
+
+
+async def soft_delete_bot(db: AsyncSession, user_id: int, bot_id: int, *, notify: bool = True) -> Bot:
+    """Hide bot from lists (`deleted_at`); keeps DB row. If ACTIVE, cancels open orders on the exchange first."""
+    bot = await get_bot(db, user_id, bot_id)
+    if bot is None:
+        raise ValueError("Bot not found")
+    if bot.lifecycle_status == BotLifecycleStatus.ACTIVE:
+        adapter = await build_binance_adapter(db, user_id=user_id, api_key_id=bot.api_key_id)
+        try:
+            try:
+                await adapter.cancel_all_orders(bot.symbol)
+            except AuthenticationError as e:
+                log.warning("soft_delete bot %s: exchange cancel skipped (%s)", bot.id, e)
+        finally:
+            await adapter.close()
+        bot.lifecycle_status = BotLifecycleStatus.STOPPED
+        bot.engine_state = EngineState.STOPPED
+    bot.deleted_at = datetime.now(timezone.utc)
+    db.add(BotEvent(bot_id=bot.id, event_type="removed_from_tracking", payload={}))
+    await events_bus.publish_user(user_id, "bots", {"event": "bot_removed", "bot_id": bot.id})
+    u = await db.get(User, user_id)
+    if notify and u is not None:
+        notify_telegram_if_enabled(u, f"Бот #{bot.id} убран из списка (данные в БД сохранены).")
+    return bot
+
+
+async def soft_delete_all_bots(db: AsyncSession, user_id: int) -> tuple[list[Bot], list[tuple[int, str]]]:
+    """Soft-delete every bot for the user that is not already hidden; commits after each success."""
+    res = await db.execute(
+        select(Bot.id)
+        .where(Bot.user_id == user_id, Bot.deleted_at.is_(None))
+        .order_by(Bot.id.asc())
+    )
+    bot_ids: list[int] = list(res.scalars().all())
+    removed: list[Bot] = []
+    failed: list[tuple[int, str]] = []
+    for bot_id in bot_ids:
+        try:
+            removed.append(await soft_delete_bot(db, user_id, bot_id, notify=False))
+            await db.commit()
+        except ValueError as e:
+            await db.rollback()
+            failed.append((bot_id, str(e)))
+    u = await db.get(User, user_id)
+    if u is not None and (removed or failed):
+        notify_telegram_if_enabled(
+            u,
+            f"Массовое снятие с отслеживания: убрано {len(removed)}, ошибок {len(failed)}.",
+        )
+    return removed, failed
 
 
 async def update_bot_config(db: AsyncSession, user: User, bot_id: int, cfg: GridFuturesConfig) -> Bot:
