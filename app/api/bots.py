@@ -1,6 +1,7 @@
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -11,14 +12,16 @@ from app.models.enums import BotLifecycleStatus
 from app.schemas.bot import (
     BotCreate,
     BotEventOut,
+    BotLiquidationCheck,
     BotOut,
     BotPatch,
     BotsCloseAllResponse,
     BotsRemoveAllResponse,
     BotsStopAllResponse,
     BotStopAllFailure,
+    LiquidationCheckOut,
 )
-from app.services import audit_service, bot_service
+from app.services import audit_service, bot_service, market_service, risk_service
 
 router = APIRouter(responses=OPENAPI_RESPONSES_PROTECTED)
 
@@ -45,6 +48,68 @@ async def create_bot(
         )
         return bot
     except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post(
+    "/check-liquidation",
+    response_model=LiquidationCheckOut,
+    summary="Рассчитать цену ликвидации",
+    description=(
+        "Сценарий: вся сетка набрана — market-вход по anchor и все лимиты исполнены как в "
+        "``app/strategies/grid.py``. Якорь цены: ``config.start_price``, иначе ``current_price``, "
+        "иначе публичный тикер Binance Futures (см. ``BINANCE_TESTNET``). "
+        "Ликвидация: LONG ``avg*(1-1/L)``, SHORT ``avg*(1+1/L)`` (без MM). "
+        "Ответ: ``liquidation_price``, ``avg_entry_price`` (взвешенная средняя), "
+        "``total_base_quantity`` (суммарный объём базовой монеты после полного набора сетки). "
+        "``total_balance`` только для грубой проверки маржи полной сетки. Без записи в БД."
+    ),
+)
+async def check_liquidation(
+    body: Annotated[
+        dict[str, Any],
+        Body(
+            examples=[
+                {
+                    "bot_type": "GRID_FUTURES",
+                    "config": {
+                        "symbol": "ETHUSDT",
+                        "direction": "LONG",
+                        "initial_amount": "0.1",
+                        "grid_orders_count": 10,
+                        "grid_step_percent": "5",
+                        "volume_mode": "linear",
+                        "start_price": None,
+                        "auto_restart": False,
+                    },
+                    "current_price": 2345,
+                    "total_balance": 1000,
+                    "leverage": 10,
+                }
+            ]
+        ),
+    ],
+    _user: Annotated[User, Depends(get_current_user)],
+):
+    try:
+        req = BotLiquidationCheck.model_validate(body)
+        cfg = req.config
+        if cfg.start_price is None:
+            if req.current_price is not None:
+                cfg = cfg.model_copy(update={"start_price": req.current_price})
+            else:
+                cfg = cfg.model_copy(update={"start_price": await market_service.fetch_last_price(cfg.symbol)})
+        metrics = await risk_service.calculate_liquidation_metrics(
+            cfg,
+            req.leverage,
+            total_balance=req.total_balance,
+        )
+        return LiquidationCheckOut(
+            liquidation_price=metrics.liquidation_price,
+            avg_entry_price=metrics.avg_entry_price,
+            total_base_quantity=metrics.total_base_quantity,
+        )
+    except (ValidationError, ValueError) as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
 

@@ -173,8 +173,10 @@ async def stop_all_active_bots(db: AsyncSession, user_id: int) -> tuple[list[Bot
     failed: list[tuple[int, str]] = []
     for bot_id in bot_ids:
         try:
-            stopped.append(await stop_bot(db, user_id, bot_id))
+            bot = await stop_bot(db, user_id, bot_id)
+            stopped.append(bot)
             await db.commit()
+            await db.refresh(bot)
         except ValueError as e:
             await db.rollback()
             failed.append((bot_id, str(e)))
@@ -241,8 +243,10 @@ async def close_all_non_closed_bots(db: AsyncSession, user_id: int) -> tuple[lis
     failed: list[tuple[int, str]] = []
     for bot_id in bot_ids:
         try:
-            closed.append(await close_bot(db, user_id, bot_id))
+            bot = await close_bot(db, user_id, bot_id)
+            closed.append(bot)
             await db.commit()
+            await db.refresh(bot)
         except ValueError as e:
             await db.rollback()
             failed.append((bot_id, str(e)))
@@ -286,8 +290,10 @@ async def soft_delete_all_bots(db: AsyncSession, user_id: int) -> tuple[list[Bot
     failed: list[tuple[int, str]] = []
     for bot_id in bot_ids:
         try:
-            removed.append(await soft_delete_bot(db, user_id, bot_id, notify=False))
+            bot = await soft_delete_bot(db, user_id, bot_id, notify=False)
+            removed.append(bot)
             await db.commit()
+            await db.refresh(bot)
         except ValueError as e:
             await db.rollback()
             failed.append((bot_id, str(e)))

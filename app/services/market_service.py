@@ -1,6 +1,8 @@
 import json
+from decimal import Decimal
 
 import ccxt.async_support as ccxt_async
+import httpx
 
 from app.core.config import get_settings
 from app.core.redis_client import get_redis
@@ -30,6 +32,23 @@ async def all_binance_futures_symbols() -> list[str]:
         await ex.close()
     await r.set(cache_key, json.dumps(symbols), ex=3600)
     return symbols
+
+
+async def fetch_last_price(symbol: str) -> Decimal:
+    s = get_settings()
+    base_url = "https://demo-fapi.binance.com" if s.binance_testnet else "https://fapi.binance.com"
+    url = f"{base_url}/fapi/v1/ticker/price"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(url, params={"symbol": symbol.strip().upper()})
+            response.raise_for_status()
+            ticker = response.json()
+    except httpx.HTTPError as e:
+        raise ValueError(f"Could not fetch last price: {e}") from e
+    last = ticker.get("price")
+    if last is None:
+        raise ValueError("Could not fetch last price")
+    return Decimal(str(last))
 
 
 async def resolve_user_symbols(user_symbols: list[str]) -> list[str]:

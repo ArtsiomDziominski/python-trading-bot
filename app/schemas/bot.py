@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 from app.models.enums import BotLifecycleStatus, BotType, EngineState, GridDirection, VolumeMode
 
@@ -34,6 +34,48 @@ class BotCreate(BaseModel):
         if v != BotType.GRID_FUTURES:
             raise ValueError("Only GRID_FUTURES is supported in MVP")
         return v
+
+
+class BotLiquidationCheck(BaseModel):
+    """Тело запроса расчёта ликвидации: конфиг сетки, якорная цена, баланс, плечо."""
+
+    bot_type: BotType = BotType.GRID_FUTURES
+    config: GridFuturesConfig
+    current_price: Decimal | None = Field(
+        default=None,
+        gt=0,
+        description="Якорная цена, если config.start_price null (без запроса к бирже)",
+    )
+    total_balance: Decimal = Field(gt=0, description="USDT balance for rough margin check only")
+    leverage: Decimal = Decimal("10")
+
+    @field_validator("bot_type")
+    @classmethod
+    def mvp_type(cls, v: BotType) -> BotType:
+        if v != BotType.GRID_FUTURES:
+            raise ValueError("Only GRID_FUTURES is supported in MVP")
+        return v
+
+    @field_validator("leverage")
+    @classmethod
+    def positive_leverage(cls, v: Decimal) -> Decimal:
+        if v <= 0:
+            raise ValueError("leverage must be greater than 0")
+        return v
+
+
+class LiquidationCheckOut(BaseModel):
+    """Ответ POST /bots/check-liquidation."""
+
+    liquidation_price: Decimal
+    avg_entry_price: Decimal
+    total_base_quantity: Decimal
+
+    @field_serializer("liquidation_price", "avg_entry_price", "total_base_quantity", when_used="json")
+    def serialize_decimals(self, v: Decimal) -> int | float:
+        if v == v.to_integral_value():
+            return int(v)
+        return float(v)
 
 
 class BotOut(BaseModel):
