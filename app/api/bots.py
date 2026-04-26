@@ -80,7 +80,6 @@ async def check_liquidation(
                         "grid_step_percent": "5",
                         "volume_mode": "linear",
                         "start_price": None,
-                        "auto_restart": False,
                     },
                     "current_price": 2345,
                     "total_balance": 1000,
